@@ -984,50 +984,48 @@ class CoreTest(unittest.TestCase):
         session.query(models.DagStat).delete()
         session.commit()
 
-        with warnings.catch_warnings(record=True) as caught_warnings:
-            models.DagStat.clean_dirty([], session=session)
-        self.assertEqual([], caught_warnings)
+        models.DagStat.update([], session=session)
 
         run1 = self.dag_bash.create_dagrun(
             run_id="run1",
             execution_date=DEFAULT_DATE,
             state=State.RUNNING)
 
-        with warnings.catch_warnings(record=True) as caught_warnings:
-            models.DagStat.clean_dirty([self.dag_bash.dag_id], session=session)
-        self.assertEqual([], caught_warnings)
+        models.DagStat.update([self.dag_bash.dag_id], session=session)
 
         qry = session.query(models.DagStat).all()
 
-        self.assertEqual(1, len(qry))
+        self.assertEqual(3, len(qry))
         self.assertEqual(self.dag_bash.dag_id, qry[0].dag_id)
-        self.assertEqual(State.RUNNING, qry[0].state)
-        self.assertEqual(1, qry[0].count)
-        self.assertFalse(qry[0].dirty)
+        for stats in qry:
+            if stats.state == State.RUNNING:
+                self.assertEqual(stats.count, 1)
+            else:
+                self.assertEqual(stats.count, 0)
+            self.assertFalse(stats.dirty)
 
         run2 = self.dag_bash.create_dagrun(
             run_id="run2",
             execution_date=DEFAULT_DATE+timedelta(days=1),
             state=State.RUNNING)
 
-        with warnings.catch_warnings(record=True) as caught_warnings:
-            models.DagStat.clean_dirty([self.dag_bash.dag_id], session=session)
-        self.assertEqual([], caught_warnings)
+        models.DagStat.update([self.dag_bash.dag_id], session=session)
 
         qry = session.query(models.DagStat).all()
 
-        self.assertEqual(1, len(qry))
+        self.assertEqual(3, len(qry))
         self.assertEqual(self.dag_bash.dag_id, qry[0].dag_id)
-        self.assertEqual(State.RUNNING, qry[0].state)
-        self.assertEqual(2, qry[0].count)
-        self.assertFalse(qry[0].dirty)
+        for stats in qry:
+            if stats.state == State.RUNNING:
+                self.assertEqual(stats.count, 2)
+            else:
+                self.assertEqual(stats.count, 0)
+            self.assertFalse(stats.dirty)
 
         session.query(models.DagRun).first().state = State.SUCCESS
         session.commit()
 
-        with warnings.catch_warnings(record=True) as caught_warnings:
-            models.DagStat.clean_dirty([self.dag_bash.dag_id], session=session)
-        self.assertEqual([], caught_warnings)
+        models.DagStat.update([self.dag_bash.dag_id], session=session)
 
         qry = session.query(models.DagStat).filter(models.DagStat.state == State.SUCCESS).all()
         self.assertEqual(1, len(qry))
@@ -2277,6 +2275,55 @@ class HDFSHookTest(unittest.TestCase):
         mock_get_connections.return_value = [c1, c2]
         client = HDFSHook().get_conn()
         self.assertIsInstance(client, snakebite.client.HAClient)
+
+
+try:
+    from airflow.hooks.http_hook import HttpHook
+except ImportError:
+    HttpHook = None
+
+
+@unittest.skipIf(HttpHook is None,
+                 "Skipping test because HttpHook is not installed")
+class HttpHookTest(unittest.TestCase):
+    def setUp(self):
+        configuration.load_test_config()
+
+    @mock.patch('airflow.hooks.http_hook.HttpHook.get_connection')
+    def test_http_connection(self, mock_get_connection):
+        c = models.Connection(conn_id='http_default', conn_type='http',
+                              host='localhost', schema='http')
+        mock_get_connection.return_value = c
+        hook = HttpHook()
+        hook.get_conn({})
+        self.assertEqual(hook.base_url, 'http://localhost')
+
+    @mock.patch('airflow.hooks.http_hook.HttpHook.get_connection')
+    def test_https_connection(self, mock_get_connection):
+        c = models.Connection(conn_id='http_default', conn_type='http',
+                              host='localhost', schema='https')
+        mock_get_connection.return_value = c
+        hook = HttpHook()
+        hook.get_conn({})
+        self.assertEqual(hook.base_url, 'https://localhost')
+
+    @mock.patch('airflow.hooks.http_hook.HttpHook.get_connection')
+    def test_host_encoded_http_connection(self, mock_get_connection):
+        c = models.Connection(conn_id='http_default', conn_type='http',
+                              host='http://localhost')
+        mock_get_connection.return_value = c
+        hook = HttpHook()
+        hook.get_conn({})
+        self.assertEqual(hook.base_url, 'http://localhost')
+
+    @mock.patch('airflow.hooks.http_hook.HttpHook.get_connection')
+    def test_host_encoded_https_connection(self, mock_get_connection):
+        c = models.Connection(conn_id='http_default', conn_type='http',
+                              host='https://localhost')
+        mock_get_connection.return_value = c
+        hook = HttpHook()
+        hook.get_conn({})
+        self.assertEqual(hook.base_url, 'https://localhost')
 
 
 try:

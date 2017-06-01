@@ -19,6 +19,7 @@ import logging
 import reprlib
 
 import os
+import socket
 import subprocess
 import textwrap
 import warnings
@@ -45,7 +46,7 @@ from airflow import api
 from airflow import jobs, settings
 from airflow import configuration as conf
 from airflow.exceptions import AirflowException
-from airflow.executors import DEFAULT_EXECUTOR
+from airflow.executors import GetDefaultExecutor
 from airflow.models import (DagModel, DagBag, TaskInstance,
                             DagPickle, DagRun, Variable, DagStat,
                             Pool, Connection)
@@ -384,6 +385,9 @@ def run(args, dag=None):
             level=settings.LOGGING_LEVEL,
             format=settings.LOG_FORMAT)
 
+    hostname = socket.getfqdn()
+    logging.info("Running on host {}".format(hostname))
+
     if not args.pickle and not dag:
         dag = get_dag(args)
     elif not dag:
@@ -439,7 +443,7 @@ def run(args, dag=None):
                 print(e)
                 raise e
 
-        executor = DEFAULT_EXECUTOR
+        executor = GetDefaultExecutor()
         executor.start()
         print("Sending to executor.")
         executor.queue_task_instance(
@@ -736,7 +740,7 @@ def webserver(args):
     error_logfile = args.error_logfile or conf.get('webserver', 'error_logfile')
     num_workers = args.workers or conf.get('webserver', 'workers')
     worker_timeout = (args.worker_timeout or
-                      conf.get('webserver', 'webserver_worker_timeout'))
+                      conf.get('webserver', 'web_server_worker_timeout'))
     ssl_cert = args.ssl_cert or conf.get('webserver', 'web_server_ssl_cert')
     ssl_key = args.ssl_key or conf.get('webserver', 'web_server_ssl_key')
     if not ssl_cert and ssl_key:

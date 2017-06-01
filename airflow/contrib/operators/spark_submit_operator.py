@@ -17,6 +17,7 @@ import logging
 from airflow.contrib.hooks.spark_submit_hook import SparkSubmitHook
 from airflow.models import BaseOperator
 from airflow.utils.decorators import apply_defaults
+from airflow.settings import WEB_COLORS
 
 log = logging.getLogger(__name__)
 
@@ -42,7 +43,9 @@ class SparkSubmitOperator(BaseOperator):
     :type jars: str
     :param java_class: the main class of the Java application
     :type java_class: str
-    :param executor_cores: Number of cores per executor (Default: 2)
+    :param total_executor_cores: (Standalone & Mesos only) Total cores for all executors (Default: all the available cores on the worker)
+    :type total_executor_cores: int
+    :param executor_cores: (Standalone & YARN only) Number of cores per executor (Default: 2)
     :type executor_cores: int
     :param executor_memory: Memory per executor (e.g. 1000M, 2G) (Default: 1G)
     :type executor_memory: str
@@ -56,9 +59,13 @@ class SparkSubmitOperator(BaseOperator):
     :type name: str
     :param num_executors: Number of executors to launch
     :type num_executors: int
+    :param application_args: Arguments for the application being submitted
+    :type application_args: list
     :param verbose: Whether to pass the verbose flag to spark-submit process for debugging
     :type verbose: bool
     """
+    template_fields = ('_name', '_application_args',)
+    ui_color = WEB_COLORS['LIGHTORANGE']
 
     @apply_defaults
     def __init__(self,
@@ -69,6 +76,7 @@ class SparkSubmitOperator(BaseOperator):
                  py_files=None,
                  jars=None,
                  java_class=None,
+                 total_executor_cores=None,
                  executor_cores=None,
                  executor_memory=None,
                  driver_memory=None,
@@ -76,6 +84,7 @@ class SparkSubmitOperator(BaseOperator):
                  principal=None,
                  name='airflow-spark',
                  num_executors=None,
+                 application_args=None,
                  verbose=False,
                  *args,
                  **kwargs):
@@ -86,6 +95,7 @@ class SparkSubmitOperator(BaseOperator):
         self._py_files = py_files
         self._jars = jars
         self._java_class = java_class
+        self._total_executor_cores = total_executor_cores
         self._executor_cores = executor_cores
         self._executor_memory = executor_memory
         self._driver_memory = driver_memory
@@ -93,6 +103,7 @@ class SparkSubmitOperator(BaseOperator):
         self._principal = principal
         self._name = name
         self._num_executors = num_executors
+        self._application_args = application_args
         self._verbose = verbose
         self._hook = None
         self._conn_id = conn_id
@@ -108,6 +119,7 @@ class SparkSubmitOperator(BaseOperator):
             py_files=self._py_files,
             jars=self._jars,
             java_class=self._java_class,
+            total_executor_cores=self._total_executor_cores,
             executor_cores=self._executor_cores,
             executor_memory=self._executor_memory,
             driver_memory=self._driver_memory,
@@ -115,6 +127,7 @@ class SparkSubmitOperator(BaseOperator):
             principal=self._principal,
             name=self._name,
             num_executors=self._num_executors,
+            application_args=self._application_args,
             verbose=self._verbose
         )
         self._hook.submit(self._application)

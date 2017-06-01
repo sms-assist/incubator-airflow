@@ -474,6 +474,8 @@ class Airflow(BaseView):
         ds = models.DagStat
         session = Session()
 
+        ds.update()
+
         qry = (
             session.query(ds.dag_id, ds.state, ds.count)
         )
@@ -936,8 +938,9 @@ class Airflow(BaseView):
         ignore_ti_state = request.args.get('ignore_ti_state') == "true"
 
         try:
-            from airflow.executors import DEFAULT_EXECUTOR as executor
+            from airflow.executors import GetDefaultExecutor
             from airflow.executors import CeleryExecutor
+            executor = GetDefaultExecutor()
             if not isinstance(executor, CeleryExecutor):
                 flash("Only works with the CeleryExecutor, sorry", "error")
                 return redirect(origin)
@@ -2169,13 +2172,20 @@ class VariableView(wwwutils.DataProfilingMixin, AirflowModelView):
             'rows': 20,
         }
     }
+    form_args = {
+        'key': {
+            'validators': {
+                validators.DataRequired(),
+            },
+        },
+    }
     column_sortable_list = (
         'key',
         'val',
         'is_encrypted',
     )
     column_formatters = {
-        'val': hidden_field_formatter
+        'val': hidden_field_formatter,
     }
 
     # Default flask-admin export functionality doesn't handle serialized json
@@ -2229,6 +2239,7 @@ class XComView(wwwutils.SuperUserMixin, AirflowModelView):
 class JobModelView(ModelViewOnly):
     verbose_name_plural = "jobs"
     verbose_name = "job"
+    column_display_actions = False
     column_default_sort = ('start_date', True)
     column_filters = (
         'job_type', 'dag_id', 'state',
@@ -2280,9 +2291,8 @@ class DagRunModelView(ModelViewOnly):
         session.commit()
         dirty_ids = []
         for row in deleted:
-            models.DagStat.set_dirty(row.dag_id, session=session)
             dirty_ids.append(row.dag_id)
-        models.DagStat.clean_dirty(dirty_ids, session=session)
+        models.DagStat.update(dirty_ids, dirty_only=False, session=session)
         session.close()
 
     @action('set_running', "Set state to 'running'", None)
@@ -2312,7 +2322,7 @@ class DagRunModelView(ModelViewOnly):
                 else:
                     dr.end_date = datetime.now()
             session.commit()
-            models.DagStat.clean_dirty(dirty_ids, session=session)
+            models.DagStat.update(dirty_ids, session=session)
             flash(
                 "{count} dag runs were set to '{target_state}'".format(**locals()))
         except Exception as ex:
@@ -2324,6 +2334,7 @@ class DagRunModelView(ModelViewOnly):
 class LogModelView(ModelViewOnly):
     verbose_name_plural = "logs"
     verbose_name = "log"
+    column_display_actions = False
     column_default_sort = ('dttm', True)
     column_filters = ('dag_id', 'task_id', 'execution_date')
     column_formatters = dict(

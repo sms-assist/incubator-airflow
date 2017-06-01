@@ -30,6 +30,7 @@ import functools
 import getpass
 import imp
 import importlib
+import itertools
 import inspect
 import zipfile
 import jinja2
@@ -59,7 +60,7 @@ from croniter import croniter
 import six
 
 from airflow import settings, utils
-from airflow.executors import DEFAULT_EXECUTOR, LocalExecutor
+from airflow.executors import GetDefaultExecutor, LocalExecutor
 from airflow import configuration
 from airflow.exceptions import AirflowException, AirflowSkipException, AirflowTaskTimeout
 from airflow.dag.base_dag import BaseDag, BaseDagBag
@@ -124,16 +125,16 @@ def clear_task_instances(tis, session, activate_dag_runs=True):
         #     session.merge(ti)
         else:
             session.delete(ti)
+
     if job_ids:
         from airflow.jobs import BaseJob as BJ
         for job in session.query(BJ).filter(BJ.id.in_(job_ids)).all():
             job.state = State.SHUTDOWN
-    if activate_dag_runs:
-        execution_dates = {ti.execution_date for ti in tis}
-        dag_ids = {ti.dag_id for ti in tis}
+
+    if activate_dag_runs and tis:
         drs = session.query(DagRun).filter(
-            DagRun.dag_id.in_(dag_ids),
-            DagRun.execution_date.in_(execution_dates),
+            DagRun.dag_id.in_({ti.dag_id for ti in tis}),
+            DagRun.execution_date.in_({ti.execution_date for ti in tis}),
         ).all()
         for dr in drs:
             dr.state = State.RUNNING
@@ -165,9 +166,12 @@ class DagBag(BaseDagBag, LoggingMixin):
     def __init__(
             self,
             dag_folder=None,
-            executor=DEFAULT_EXECUTOR,
+            executor=None,
             include_examples=configuration.getboolean('core', 'LOAD_EXAMPLES')):
 
+        # do not use default arg in signature, to fix import cycle on plugin load
+        if executor is None:
+            executor = GetDefaultExecutor()
         dag_folder = dag_folder or settings.DAGS_FOLDER
         self.logger.info("Filling up the DagBag from {}".format(dag_folder))
         self.dag_folder = dag_folder
@@ -739,6 +743,7 @@ class TaskInstance(Base):
     even while multiple schedulers may be firing task instances.
     """
 
+
     __tablename__ = "task_instance"
 
     task_id = Column(String(ID_LEN), primary_key=True)
@@ -1181,13 +1186,19 @@ class TaskInstance(Base):
         """
         delay = self.task.retry_delay
         if self.task.retry_exponential_backoff:
+            min_backoff = int(delay.total_seconds() * (2 ** (self.try_number - 2)))
+            # deterministic per task instance
+            hash = int(hashlib.sha1("{}#{}#{}#{}".format(self.dag_id, self.task_id,
+                self.execution_date, self.try_number).encode('utf-8')).hexdigest(), 16)
+            # between 0.5 * delay * (2^retry_number) and 1.0 * delay * (2^retry_number)
+            modded_hash = min_backoff + hash % min_backoff
             # timedelta has a maximum representable value. The exponentiation
             # here means this value can be exceeded after a certain number
             # of tries (around 50 if the initial delay is 1s, even fewer if
             # the delay is larger). Cap the value here before creating a
             # timedelta object so the operation doesn't fail.
             delay_backoff_in_seconds = min(
-                delay.total_seconds() * (2 ** (self.try_number - 1)),
+                modded_hash,
                 timedelta.max.total_seconds() - 1
             )
             delay = timedelta(seconds=delay_backoff_in_seconds)
@@ -2241,11 +2252,13 @@ class BaseOperator(object):
         memo[id(self)] = result
 
         for k, v in list(self.__dict__.items()):
-            if k not in ('user_defined_macros', 'params'):
+            if k not in ('user_defined_macros', 'user_defined_filters', 'params'):
                 setattr(result, k, copy.deepcopy(v, memo))
         result.params = self.params
         if hasattr(self, 'user_defined_macros'):
             result.user_defined_macros = self.user_defined_macros
+        if hasattr(self, 'user_defined_filters'):
+            result.user_defined_filters = self.user_defined_filters
         return result
 
     def render_template_from_field(self, attr, content, context, jinja_env):
@@ -2361,7 +2374,7 @@ class BaseOperator(object):
 
         count = qry.count()
 
-        clear_task_instances(qry, session)
+        clear_task_instances(qry.all(), session)
 
         session.commit()
         session.close()
@@ -2636,6 +2649,12 @@ class DAG(BaseDag, LoggingMixin):
         templates related to this DAG. Note that you can pass any
         type of object here.
     :type user_defined_macros: dict
+    :param user_defined_filters: a dictionary of filters that will be exposed
+        in your jinja templates. For example, passing
+        ``dict(hello=lambda name: 'Hello %s' % name)`` to this argument allows
+        you to ``{{ 'world' | hello }}`` in all jinja templates related to
+        this DAG.
+    :type user_defined_filters: dict
     :param default_args: A dictionary of default parameters to be used
         as constructor keyword parameters when initialising operators.
         Note that operators have the same hook, and precede those defined
@@ -2676,6 +2695,7 @@ class DAG(BaseDag, LoggingMixin):
             full_filepath=None,
             template_searchpath=None,
             user_defined_macros=None,
+            user_defined_filters=None,
             default_args=None,
             concurrency=configuration.getint('core', 'dag_concurrency'),
             max_active_runs=configuration.getint(
@@ -2688,6 +2708,7 @@ class DAG(BaseDag, LoggingMixin):
             params=None):
 
         self.user_defined_macros = user_defined_macros
+        self.user_defined_filters = user_defined_filters
         self.default_args = default_args or {}
         self.params = params or {}
 
@@ -3015,18 +3036,10 @@ class DAG(BaseDag, LoggingMixin):
         for t in self.tasks:
             t.resolve_template_files()
 
-    def crawl_for_tasks(objects):
-        """
-        Typically called at the end of a script by passing globals() as a
-        parameter. This allows to not explicitly add every single task to the
-        dag explicitly.
-        """
-        raise NotImplementedError("")
-
     def get_template_env(self):
         """
         Returns a jinja2 Environment while taking into account the DAGs
-        template_searchpath and user_defined_macros
+        template_searchpath, user_defined_macros and user_defined_filters
         """
         searchpath = [self.folder]
         if self.template_searchpath:
@@ -3038,6 +3051,8 @@ class DAG(BaseDag, LoggingMixin):
             cache_size=0)
         if self.user_defined_macros:
             env.globals.update(self.user_defined_macros)
+        if self.user_defined_filters:
+            env.filters.update(self.user_defined_filters)
 
         return env
 
@@ -3064,7 +3079,7 @@ class DAG(BaseDag, LoggingMixin):
         )
         if state:
             tis = tis.filter(TI.state == state)
-        tis = tis.all()
+        tis = tis.order_by(TI.execution_date).all()
         return tis
 
     @property
@@ -3129,7 +3144,7 @@ class DAG(BaseDag, LoggingMixin):
         for dr in drs:
             dr.state = state
             dirty_ids.append(dr.dag_id)
-        DagStat.clean_dirty(dirty_ids, session=session)
+        DagStat.update(dirty_ids, session=session)
 
     def clear(
             self, start_date=None, end_date=None,
@@ -3150,9 +3165,11 @@ class DAG(BaseDag, LoggingMixin):
             # Crafting the right filter for dag_id and task_ids combo
             conditions = []
             for dag in self.subdags + [self]:
-                conditions.append(
-                    TI.dag_id.like(dag.dag_id) & TI.task_id.in_(dag.task_ids)
-                )
+                if dag.task_ids:
+                    conditions.append(
+                        TI.dag_id.like(dag.dag_id) &
+                        TI.task_id.in_(dag.task_ids)
+                    )
             tis = tis.filter(or_(*conditions))
         else:
             tis = session.query(TI).filter(TI.dag_id == self.dag_id)
@@ -3186,7 +3203,7 @@ class DAG(BaseDag, LoggingMixin):
             do_it = utils.helpers.ask_yesno(question)
 
         if do_it:
-            clear_task_instances(tis, session)
+            clear_task_instances(tis.all(), session)
             if reset_dag_runs:
                 self.set_dag_runs_state(session=session)
         else:
@@ -3204,10 +3221,11 @@ class DAG(BaseDag, LoggingMixin):
         result = cls.__new__(cls)
         memo[id(self)] = result
         for k, v in list(self.__dict__.items()):
-            if k not in ('user_defined_macros', 'params'):
+            if k not in ('user_defined_macros', 'user_defined_filters', 'params'):
                 setattr(result, k, copy.deepcopy(v, memo))
 
         result.user_defined_macros = self.user_defined_macros
+        result.user_defined_filters = self.user_defined_filters
         result.params = self.params
         return result
 
@@ -3307,8 +3325,21 @@ class DAG(BaseDag, LoggingMixin):
         """
         if not self.start_date and not task.start_date:
             raise AirflowException("Task is missing the start_date parameter")
-        if not task.start_date:
+        # if the task has no start date, assign it the same as the DAG
+        elif not task.start_date:
             task.start_date = self.start_date
+        # otherwise, the task will start on the later of its own start date and
+        # the DAG's start date
+        elif self.start_date:
+            task.start_date = max(task.start_date, self.start_date)
+
+        # if the task has no end date, assign it the same as the dag
+        if not task.end_date:
+            task.end_date = self.end_date
+        # otherwise, the task will end on the earlier of its own end date and
+        # the DAG's end date
+        elif task.end_date and self.end_date:
+            task.end_date = min(task.end_date, self.end_date)
 
         if task.task_id in self.task_dict:
             # TODO: raise an error in Airflow 2.0
@@ -3364,7 +3395,7 @@ class DAG(BaseDag, LoggingMixin):
         if not executor and local:
             executor = LocalExecutor()
         elif not executor:
-            executor = DEFAULT_EXECUTOR
+            executor = GetDefaultExecutor()
         job = BackfillJob(
             self,
             start_date=start_date,
@@ -3423,6 +3454,9 @@ class DAG(BaseDag, LoggingMixin):
             state=state
         )
         session.add(run)
+
+        DagStat.set_dirty(dag_id=self.dag_id, session=session)
+
         session.commit()
 
         run.dag = self
@@ -3432,12 +3466,7 @@ class DAG(BaseDag, LoggingMixin):
         run.verify_integrity(session=session)
 
         run.refresh_from_db()
-        DagStat.set_dirty(self.dag_id, session=session)
 
-        # add a placeholder row into DagStat table
-        if not session.query(DagStat).filter(DagStat.dag_id == self.dag_id).first():
-            session.add(DagStat(dag_id=self.dag_id, state=state, count=0, dirty=True))
-        session.commit()
         return run
 
     @staticmethod
@@ -3848,7 +3877,7 @@ class DagStat(Base):
     count = Column(Integer, default=0)
     dirty = Column(Boolean, default=False)
 
-    def __init__(self, dag_id, state, count, dirty=False):
+    def __init__(self, dag_id, state, count=0, dirty=False):
         self.dag_id = dag_id
         self.state = state
         self.count = count
@@ -3857,48 +3886,100 @@ class DagStat(Base):
     @staticmethod
     @provide_session
     def set_dirty(dag_id, session=None):
-        for dag in session.query(DagStat).filter(DagStat.dag_id == dag_id):
-            dag.dirty = True
-        session.commit()
+        """
+        :param dag_id: the dag_id to mark dirty
+        :param session: database session
+        :return:
+        """
+        DagStat.create(dag_id=dag_id, session=session)
+
+        try:
+            stats = session.query(DagStat).filter(
+                DagStat.dag_id == dag_id
+            ).with_for_update().all()
+
+            for stat in stats:
+                stat.dirty = True
+            session.commit()
+        except Exception as e:
+            session.rollback()
+            logging.warning("Could not update dag stats for {}".format(dag_id))
+            logging.exception(e)
 
     @staticmethod
     @provide_session
-    def clean_dirty(dag_ids, session=None):
+    def update(dag_ids=None, dirty_only=True, session=None):
         """
-        Cleans out the dirty/out-of-sync rows from dag_stats table
+        Updates the stats for dirty/out-of-sync dags
 
-        :param dag_ids: dag_ids that may be dirty
+        :param dag_ids: dag_ids to be updated
         :type dag_ids: list
+        :param dirty_only: only updated for marked dirty, defaults to True
+        :type dirty_only: bool
+        :param session: db session to use
+        :type session: Session
         """
-        # avoid querying with an empty IN clause
-        if not dag_ids:
-            return
+        try:
+            qry = session.query(DagStat)
+            if dag_ids:
+                qry = qry.filter(DagStat.dag_id.in_(set(dag_ids)))
+            if dirty_only:
+                qry = qry.filter(DagStat.dirty == True)
 
-        dag_ids = set(dag_ids)
+            qry = qry.with_for_update().all()
 
-        qry = (
-            session.query(DagStat)
-            .filter(and_(DagStat.dag_id.in_(dag_ids), DagStat.dirty == True))
-        )
+            ids = set([dag_stat.dag_id for dag_stat in qry])
 
-        dirty_ids = {dag.dag_id for dag in qry.all()}
-        qry.delete(synchronize_session='fetch')
-        session.commit()
+            # avoid querying with an empty IN clause
+            if len(ids) == 0:
+                session.commit()
+                return
 
-        # avoid querying with an empty IN clause
-        if not dirty_ids:
-            return
+            dagstat_states = set(itertools.product(ids, State.dag_states))
+            qry = (
+                session.query(DagRun.dag_id, DagRun.state, func.count('*'))
+                .filter(DagRun.dag_id.in_(ids))
+                .group_by(DagRun.dag_id, DagRun.state)
+            )
 
-        qry = (
-            session.query(DagRun.dag_id, DagRun.state, func.count('*'))
-            .filter(DagRun.dag_id.in_(dirty_ids))
-            .group_by(DagRun.dag_id, DagRun.state)
-        )
+            counts = {(dag_id, state): count for dag_id, state, count in qry}
+            for dag_id, state in dagstat_states:
+                count = 0
+                if (dag_id, state) in counts:
+                    count = counts[(dag_id, state)]
 
-        for dag_id, state, count in qry:
-            session.add(DagStat(dag_id=dag_id, state=state, count=count))
+                session.merge(
+                    DagStat(dag_id=dag_id, state=state, count=count, dirty=False)
+                )
 
-        session.commit()
+            session.commit()
+        except Exception as e:
+            session.rollback()
+            logging.warning("Could not update dag stat table")
+            logging.exception(e)
+
+    @staticmethod
+    @provide_session
+    def create(dag_id, session=None):
+        """
+        Creates the missing states the stats table for the dag specified
+
+        :param dag_id: dag id of the dag to create stats for
+        :param session: database session
+        :return:
+        """
+        # unfortunately sqlalchemy does not know upsert
+        qry = session.query(DagStat).filter(DagStat.dag_id == dag_id).all()
+        states = [dag_stat.state for dag_stat in qry]
+        for state in State.dag_states:
+            if state not in states:
+                try:
+                    session.merge(DagStat(dag_id=dag_id, state=state))
+                    session.commit()
+                except Exception as e:
+                    session.rollback()
+                    logging.warning("Could not create stat record")
+                    logging.exception(e)
 
 
 class DagRun(Base):
@@ -3944,10 +4025,11 @@ class DagRun(Base):
     def set_state(self, state):
         if self._state != state:
             self._state = state
-            # something really weird goes on here: if you try to close the session
-            # dag runs will end up detached
-            session = settings.Session()
-            DagStat.set_dirty(self.dag_id, session=session)
+            if self.dag_id is not None:
+                # something really weird goes on here: if you try to close the session
+                # dag runs will end up detached
+                session = settings.Session()
+                DagStat.set_dirty(self.dag_id, session=session)
 
     @declared_attr
     def state(self):
@@ -3980,7 +4062,8 @@ class DagRun(Base):
     @staticmethod
     @provide_session
     def find(dag_id=None, run_id=None, execution_date=None,
-             state=None, external_trigger=None, session=None):
+             state=None, external_trigger=None, no_backfills=False,
+             session=None):
         """
         Returns a set of dag runs for the given search criteria.
         :param dag_id: the dag_id to find dag runs for
@@ -3993,6 +4076,9 @@ class DagRun(Base):
         :type state: State
         :param external_trigger: whether this dag run is externally triggered
         :type external_trigger: bool
+        :param no_backfills: return no backfills (True), return all (False).
+        Defaults to False
+        :type no_backfills: bool
         :param session: database session
         :type session: Session
         """
@@ -4012,6 +4098,10 @@ class DagRun(Base):
             qry = qry.filter(DR.state == state)
         if external_trigger is not None:
             qry = qry.filter(DR.external_trigger == external_trigger)
+        if no_backfills:
+            # in order to prevent a circular dependency
+            from airflow.jobs import BackfillJob
+            qry = qry.filter(DR.run_id.notlike(BackfillJob.ID_PREFIX + '%'))
 
         dr = qry.order_by(DR.execution_date).all()
 
